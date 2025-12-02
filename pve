@@ -1,0 +1,1194 @@
+#!/bin/bash
+
+# Couleurs avec tput (plus portable)
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
+YELLOW=$(tput setaf 3)
+BLUE=$(tput setaf 4)
+CYAN=$(tput setaf 6)
+BOLD=$(tput bold)
+NC=$(tput sgr0) # No Color
+
+# Fonction d'aide
+show_help() {
+    echo "${GREEN}PVE - Proxmox Remote Manager${NC}"
+    echo "Usage: pve <host> <command> [args]"
+    echo ""
+    echo "${BLUE}Commandes générales:${NC}"
+    echo "  ${YELLOW}ls${NC}                          Liste tous les conteneurs et VMs"
+    echo "  ${YELLOW}exec${NC} <id> -- <cmd>          Exécute une commande dans un conteneur"
+    echo "  ${YELLOW}shell${NC} <id>                  Ouvre un shell/console dans un conteneur/VM"
+    echo "  ${YELLOW}start${NC} <id>                  Démarre un conteneur/VM"
+    echo "  ${YELLOW}stop${NC} <id>                   Arrête un conteneur/VM"
+    echo "  ${YELLOW}restart${NC} <id>                Redémarre un conteneur/VM"
+    echo "  ${YELLOW}delete${NC} <id>                 Supprime un conteneur/VM"
+    echo "  ${YELLOW}info${NC} <id>                   Affiche les infos d'un conteneur/VM"
+    echo ""
+    echo "${BLUE}Gestion des conteneurs (LXC):${NC}"
+    echo "  ${YELLOW}create${NC} <id>                 Crée un conteneur (mode interactif)"
+    echo "  ${YELLOW}launch${NC} <tpl> <name> [id]   Crée et démarre un conteneur (rapide)"
+    echo ""
+    echo "${BLUE}Gestion des VMs (QEMU):${NC}"
+    echo "  ${YELLOW}create-vm${NC} <id>              Crée une VM (mode interactif)"
+    echo ""
+    echo "${BLUE}Templates et stockage:${NC}"
+    echo "  ${YELLOW}list-templates${NC}              Liste les templates disponibles au téléchargement"
+    echo "  ${YELLOW}list-images${NC}                 Liste les templates déjà téléchargés"
+    echo "  ${YELLOW}list-iso${NC}                    Liste les ISOs disponibles"
+    echo "  ${YELLOW}list-storage${NC}                Liste les storages disponibles"
+    echo "  ${YELLOW}download${NC} <template>         Télécharge un template"
+    echo ""
+    echo "${BLUE}Autres:${NC}"
+    echo "  ${YELLOW}interactive${NC}                 Mode interactif"
+    echo ""
+    echo "${BLUE}Exemples:${NC}"
+    echo "  pve _beelink ls"
+    echo "  pve _beelink list-storage"
+    echo "  pve _beelink list-images"
+    echo "  pve _beelink list-iso"
+    echo "  pve _beelink launch debian-12 webserver"
+    echo "  pve _beelink create 100"
+    echo "  pve _beelink create-vm 200"
+    echo "  pve _beelink exec 100 -- apt update"
+    echo "  pve _beelink shell 100"
+    echo "  pve _beelink interactive"
+    echo ""
+    echo "${CYAN}Mode interactif:${NC}"
+    echo "  Dans ce mode, l'hôte est conservé et vous tapez directement les commandes."
+}
+
+# Fonction pour exécuter une commande sur l'hôte distant
+remote_exec() {
+    local host=$1
+    shift
+    ssh -q -o LogLevel=ERROR "$host" "$@"
+}
+
+# Fonction pour lister les conteneurs et VMs
+lxc_ls() {
+    local host=$1
+
+    echo "${GREEN}=== Conteneurs et VMs sur $host ===${NC}"
+    echo ""
+
+    ssh -q -o LogLevel=ERROR "$host" 'bash -s' << 'REMOTE_SCRIPT'
+printf "%-6s %-11s %-10s %-18s %-12s %-15s %-30s\n" "VMID" "TYPE" "STATUS" "NAME" "MEMORY" "GATEWAY" "IP(<BRIDGE>)"
+printf "%s\n" "--------------------------------------------------------------------------------------------------------------"
+
+# Créer un fichier temporaire pour stocker et trier les résultats
+tmpfile=$(mktemp)
+
+# Conteneurs - lecture directe des configs (beaucoup plus rapide)
+pct list 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+    vmid=$(echo "$line" | awk '{print $1}')
+    status=$(echo "$line" | awk '{print $2}')
+    name=$(echo "$line" | awk '{for(i=4;i<=NF;i++) printf "%s ", $i; print ""}' | xargs)
+    [[ -z "$name" ]] && name=$(echo "$line" | awk '{print $3}')
+
+    # Lire directement le fichier de config (évite pct config)
+    config_file="/etc/pve/lxc/${vmid}.conf"
+    mem_alloc=""
+    gateway=""
+    ip_display=""
+    if [[ -f "$config_file" ]]; then
+        mem_alloc=$(grep "^memory:" "$config_file" 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
+        # Collecter les paires IP-BRIDGE et gateways
+        ip_bridge_pairs=()
+        gateways=()
+        while IFS= read -r config_line; do
+            if [[ $config_line =~ ^net[0-9]+: ]]; then
+                ip=$(echo "$config_line" | grep -oP 'ip=\K[0-9.]+(/\d+)?' 2>/dev/null | cut -d'/' -f1)
+                bridge=$(echo "$config_line" | grep -oP 'bridge=\K[^,]+' 2>/dev/null)
+                gw=$(echo "$config_line" | grep -oP 'gw=\K[0-9.]+' 2>/dev/null)
+                if [[ -n "$ip" && -n "$bridge" ]]; then
+                    ip_bridge_pairs+=("$ip ($bridge)")
+                fi
+                if [[ -n "$gw" ]]; then
+                    gateways+=("$gw")
+                fi
+            fi
+        done < "$config_file"
+        gateway=$(echo "${gateways[0]}" 2>/dev/null | head -1)
+        # Trier et dédupliquer les paires IP-BRIDGE
+        ip_bridge_pairs=($(printf '%s\n' "${ip_bridge_pairs[@]}" | sort | uniq))
+        ip_display=$(printf '%s, ' "${ip_bridge_pairs[@]}" | sed 's/, $//')
+    fi
+
+    [[ -z "$mem_alloc" ]] && mem_alloc="?"
+    [[ -z "$gateway" ]] && gateway="-"
+    if [[ "$status" == "running" ]]; then
+        [[ -z "$ip_display" ]] && ip_display="dhcp"
+    else
+        ip_display="-"
+    fi
+
+    printf "%-6s %-11s %-10s %-18s %-12s %-15s %-30s\n" \
+        "$vmid" "CONTAINER" "$status" "${name:0:18}" "${mem_alloc}MB" "$gateway" "$ip_display" >> "$tmpfile"
+done
+
+# VMs - lecture des configs aussi
+qm list 2>/dev/null | tail -n +2 | while read vmid name status mem bootdisk pid; do
+    config_file="/etc/pve/qemu-server/${vmid}.conf"
+    bridge=""
+    gateway=""
+    if [[ -f "$config_file" ]]; then
+        # Extraire le bridge de la première interface réseau (net0, net1, etc.)
+        bridge=$(grep -oP '^net\d+:.*bridge=\K[^,]+' "$config_file" 2>/dev/null | head -1)
+        gateway=$(grep -oP '^ipconfig\d+:.*gw=\K[0-9.]+' "$config_file" 2>/dev/null | head -1)
+    fi
+    [[ -z "$bridge" ]] && bridge="-"
+    [[ -z "$gateway" ]] && gateway="-"
+    if [[ "$status" == "running" ]]; then
+        ip_addr=$(qm guest exec $vmid -- hostname -I 2>/dev/null | awk '{print $1}' | head -1)
+        if [[ -n "$ip_addr" ]]; then
+            ip_display="$ip_addr ($bridge)"
+        else
+            ip_display="(console)"
+        fi
+    else
+        ip_display="-"
+    fi
+
+    printf "%-6s %-11s %-10s %-18s %-12s %-15s %-30s\n" \
+        "$vmid" "VM" "$status" "${name:0:18}" "${mem}MB" "$gateway" "$ip_display" >> "$tmpfile"
+done
+
+# Trier par VMID et afficher
+sort -n "$tmpfile"
+rm -f "$tmpfile"
+REMOTE_SCRIPT
+
+    echo ""
+    echo "${CYAN}Astuce: Les VMIDs disponibles sont ceux non listés ci-dessus${NC}"
+}
+
+# Fonction exec
+lxc_exec() {
+    local host=$1
+    local id=$2
+    shift 2
+
+    # Retirer le -- si présent
+    if [[ "$1" == "--" ]]; then
+        shift
+    fi
+
+    local type=$(ssh -q -o LogLevel=ERROR "$host" "pct status '$id' &>/dev/null && echo ct || (qm status '$id' &>/dev/null && echo vm || echo unknown)")
+
+    if [[ "$type" == "ct" ]]; then
+        # Échapper les arguments pour le passage SSH
+        local cmd=""
+        for arg in "$@"; do
+            cmd+=" $(printf '%q' "$arg")"
+        done
+
+        # Si la commande est bash/sh, utiliser -t pour avoir un terminal interactif
+        if [[ "$1" == "bash" || "$1" == "sh" || "$1" == "/bin/bash" || "$1" == "/bin/sh" ]]; then
+            ssh -t "$host" "pct enter '$id'"
+        else
+            ssh -q -o LogLevel=ERROR "$host" "pct exec '$id' -- $cmd"
+        fi
+    elif [[ "$type" == "vm" ]]; then
+        echo -e "${RED}Erreur: exec n'est pas supporté pour les VMs (ID: $id)${NC}"
+        echo "Utilisez SSH ou la console: qm terminal $id"
+        return 1
+    else
+        echo -e "${RED}Erreur: Conteneur/VM $id non trouvé${NC}"
+        return 1
+    fi
+}
+
+# Fonction shell
+lxc_shell() {
+    local host=$1
+    local id=$2
+
+    local type=$(ssh -q -o LogLevel=ERROR "$host" "pct status '$id' &>/dev/null && echo ct || (qm status '$id' &>/dev/null && echo vm || echo unknown)")
+
+    if [[ "$type" == "ct" ]]; then
+        ssh -t "$host" "pct enter '$id'"
+    elif [[ "$type" == "vm" ]]; then
+        echo -e "${YELLOW}Tentative d'ouverture de la console série VM $id...${NC}"
+        local result=$(ssh -t "$host" "qm terminal '$id'" 2>&1)
+        local exit_code=$?
+
+        if [[ $exit_code -ne 0 ]] || echo "$result" | grep -q "unable to find a serial interface"; then
+            echo ""
+            echo -e "${RED}✗ La console série n'est pas disponible${NC}"
+            echo ""
+            echo -e "${CYAN}Pour accéder à la console de cette VM:${NC}"
+            echo ""
+            echo -e "${GREEN}Option recommandée - Console VNC (interface graphique):${NC}"
+            echo "  1. Ouvrir l'interface web Proxmox: ${BOLD}https://$host:8006${NC}"
+            echo "  2. Naviguer vers: Datacenter > VM $id > Console"
+            echo ""
+            echo -e "${YELLOW}Note:${NC} La console série fonctionne uniquement pour les VMs configurées"
+            echo "      avec une interface série. Pour les installations graphiques (Ubuntu,"
+            echo "      Debian avec GUI), utilisez la console VNC via l'interface web."
+            return 1
+        fi
+    else
+        echo -e "${RED}Erreur: Conteneur/VM $id non trouvé${NC}"
+        return 1
+    fi
+}
+
+# Fonction start
+lxc_start() {
+    local host=$1
+    local id=$2
+
+    local type=$(ssh -q -o LogLevel=ERROR "$host" "pct status '$id' &>/dev/null && echo ct || (qm status '$id' &>/dev/null && echo vm || echo unknown)")
+
+    if [[ "$type" == "ct" ]]; then
+        echo -e "${GREEN}Démarrage du conteneur $id...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "pct start '$id'"
+    elif [[ "$type" == "vm" ]]; then
+        echo -e "${GREEN}Démarrage de la VM $id...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "qm start '$id'"
+    else
+        echo -e "${RED}Erreur: Conteneur/VM $id non trouvé${NC}"
+        return 1
+    fi
+}
+
+# Fonction stop
+lxc_stop() {
+    local host=$1
+    local id=$2
+
+    local type=$(ssh -q -o LogLevel=ERROR "$host" "pct status '$id' &>/dev/null && echo ct || (qm status '$id' &>/dev/null && echo vm || echo unknown)")
+
+    if [[ "$type" == "ct" ]]; then
+        echo -e "${YELLOW}Arrêt du conteneur $id...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "pct stop '$id'"
+    elif [[ "$type" == "vm" ]]; then
+        echo -e "${YELLOW}Arrêt de la VM $id...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "qm stop '$id'"
+    else
+        echo -e "${RED}Erreur: Conteneur/VM $id non trouvé${NC}"
+        return 1
+    fi
+}
+
+# Fonction restart
+lxc_restart() {
+    local host=$1
+    local id=$2
+
+    local type=$(ssh -q -o LogLevel=ERROR "$host" "pct status '$id' &>/dev/null && echo ct || (qm status '$id' &>/dev/null && echo vm || echo unknown)")
+
+    if [[ "$type" == "ct" ]]; then
+        echo -e "${BLUE}Redémarrage du conteneur $id...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "pct restart '$id'"
+    elif [[ "$type" == "vm" ]]; then
+        echo -e "${BLUE}Redémarrage de la VM $id...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "qm restart '$id'"
+    else
+        echo -e "${RED}Erreur: Conteneur/VM $id non trouvé${NC}"
+        return 1
+    fi
+}
+
+# Fonction delete
+lxc_delete() {
+    local host=$1
+    local id=$2
+
+    local type=$(ssh -q -o LogLevel=ERROR "$host" "pct status '$id' &>/dev/null && echo ct || (qm status '$id' &>/dev/null && echo vm || echo unknown)")
+
+    if [[ "$type" == "unknown" ]]; then
+        echo -e "${RED}Erreur: Conteneur/VM $id non trouvé${NC}"
+        return 1
+    fi
+
+    echo -e "${RED}ATTENTION: Voulez-vous vraiment supprimer le $type $id sur $host? (oui/non)${NC}"
+    read -r confirm
+
+    if [[ "$confirm" == "oui" ]]; then
+        if [[ "$type" == "ct" ]]; then
+            ssh -q -o LogLevel=ERROR "$host" "pct destroy '$id'"
+            echo -e "${GREEN}Conteneur $id supprimé${NC}"
+        else
+            ssh -q -o LogLevel=ERROR "$host" "qm destroy '$id'"
+            echo -e "${GREEN}VM $id supprimée${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Annulé${NC}"
+    fi
+}
+
+# Fonction info
+lxc_info() {
+    local host=$1
+    local id=$2
+
+    local type=$(ssh -q -o LogLevel=ERROR "$host" "pct status '$id' &>/dev/null && echo ct || (qm status '$id' &>/dev/null && echo vm || echo unknown)")
+
+    if [[ "$type" == "ct" ]]; then
+        echo -e "${GREEN}=== Informations conteneur $id ===${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "pct config '$id'"
+        echo ""
+        ssh -q -o LogLevel=ERROR "$host" "pct status '$id'"
+    elif [[ "$type" == "vm" ]]; then
+        echo -e "${GREEN}=== Informations VM $id ===${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "qm config '$id'"
+        echo ""
+        ssh -q -o LogLevel=ERROR "$host" "qm status '$id'"
+    else
+        echo -e "${RED}Erreur: Conteneur/VM $id non trouvé${NC}"
+        return 1
+    fi
+}
+
+# Fonction list-templates
+lxc_list_templates() {
+    local host=$1
+
+    echo -e "${GREEN}=== Templates disponibles ===${NC}"
+    ssh -q -o LogLevel=ERROR "$host" "pveam available | grep -E '^(system|mail|turnkeylinux)' | head -30"
+    echo ""
+    echo -e "${BLUE}Pour télécharger un template:${NC}"
+    echo "  pve <host> download <template>"
+}
+
+# Fonction download template
+lxc_download() {
+    local host=$1
+    local template=$2
+
+    if [[ -z "$template" ]]; then
+        echo -e "${RED}Usage: pve $host download <template>${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}Téléchargement du template $template sur $host...${NC}"
+    remote_exec "$host" "pveam download local $template"
+}
+
+# Fonction list-images (templates déjà téléchargés)
+list_images() {
+    local host=$1
+
+    echo -e "${GREEN}=== Images/Templates téléchargés sur $host ===${NC}"
+    echo ""
+    ssh -q -o LogLevel=ERROR "$host" 'bash -s' << 'REMOTE_SCRIPT'
+if [[ -d "/var/lib/vz/template/cache/" ]]; then
+    cd /var/lib/vz/template/cache/
+    if ls -1 *.tar.* 2>/dev/null | head -1 > /dev/null; then
+        printf "%-50s %-12s %-20s\n" "TEMPLATE" "SIZE" "DATE"
+        printf "%s\n" "--------------------------------------------------------------------------------"
+        ls -lh --time-style=long-iso *.tar.* 2>/dev/null | awk '{
+            size = $5
+            date = $6 " " $7
+            file = $8
+            printf "%-50s %-12s %-20s\n", file, size, date
+        }'
+    else
+        echo "Aucun template téléchargé"
+    fi
+else
+    echo "Répertoire de templates non trouvé"
+fi
+REMOTE_SCRIPT
+    echo ""
+    echo -e "${CYAN}Utilisez 'pve $host list-templates' pour voir les templates disponibles au téléchargement${NC}"
+}
+
+# Fonction list-iso (ISOs disponibles)
+list_iso() {
+    local host=$1
+
+    echo -e "${GREEN}=== ISOs disponibles sur $host ===${NC}"
+    echo ""
+    ssh -q -o LogLevel=ERROR "$host" 'bash -s' << 'REMOTE_SCRIPT'
+# Trouver tous les storages qui contiennent des ISOs
+for storage_dir in /var/lib/vz/template/iso /mnt/pve/*/template/iso; do
+    if [[ -d "$storage_dir" ]]; then
+        # Extraire le nom du storage depuis le chemin
+        if [[ "$storage_dir" == "/var/lib/vz/template/iso" ]]; then
+            storage_name="local"
+        else
+            storage_name=$(echo "$storage_dir" | cut -d'/' -f4)
+        fi
+
+        # Lister les ISOs dans ce storage
+        iso_count=$(ls -1 "$storage_dir"/*.iso 2>/dev/null | wc -l)
+        if [[ $iso_count -gt 0 ]]; then
+            echo "Storage: $storage_name ($storage_dir)"
+            printf "  %-50s %-12s %-20s\n" "ISO" "SIZE" "DATE"
+            printf "  %s\n" "------------------------------------------------------------------------------"
+            ls -lh --time-style=long-iso "$storage_dir"/*.iso 2>/dev/null | awk -v storage="$storage_name" '{
+                size = $5
+                date = $6 " " $7
+                file = $8
+                gsub(/.*\//, "", file)
+                printf "  %-50s %-12s %-20s\n", file, size, date
+            }'
+            echo ""
+        fi
+    fi
+done
+
+# Vérifier s'il y a des ISOs
+total_isos=$(find /var/lib/vz/template/iso /mnt/pve/*/template/iso -maxdepth 1 -name "*.iso" 2>/dev/null | wc -l)
+if [[ $total_isos -eq 0 ]]; then
+    echo "Aucune ISO trouvée"
+fi
+REMOTE_SCRIPT
+}
+
+# Fonction list-storage
+list_storage() {
+    local host=$1
+
+    echo -e "${GREEN}=== Storages disponibles sur $host ===${NC}"
+    echo ""
+    ssh -q -o LogLevel=ERROR "$host" 'bash -s' << 'REMOTE_SCRIPT'
+printf "%-15s %-10s %-12s %-12s %-12s %-10s\n" "NAME" "TYPE" "TOTAL" "USED" "AVAILABLE" "USAGE %"
+printf "%s\n" "--------------------------------------------------------------------------------"
+pvesm status | awk 'NR>1 {
+    name = $1
+    type = $2
+    total_gb = sprintf("%.1f GB", $4/1024/1024)
+    used_gb = sprintf("%.1f GB", $5/1024/1024)
+    avail_gb = sprintf("%.1f GB", $6/1024/1024)
+    percent = $7
+    printf "%-15s %-10s %-12s %-12s %-12s %-10s\n", name, type, total_gb, used_gb, avail_gb, percent
+}'
+REMOTE_SCRIPT
+    echo ""
+}
+
+# Fonction create (mode interactif)
+lxc_create() {
+    local host=$1
+    local id=$2
+
+    if [[ -z "$id" ]]; then
+        echo "${RED}Usage: pve $host create <id>${NC}"
+        return 1
+    fi
+
+    # Vérifier si l'ID est déjà utilisé et proposer un nouveau
+    local id_in_use=$(ssh -q -o LogLevel=ERROR "$host" "pct status $id &>/dev/null && echo yes || (qm status $id &>/dev/null && echo yes || echo no)")
+    if [[ "$id_in_use" == "yes" ]]; then
+        echo "${YELLOW}⚠ L'ID $id est déjà utilisé${NC}"
+
+        # Trouver le prochain ID disponible
+        local new_id=$(ssh -q -o LogLevel=ERROR "$host" "
+            for i in {$id..999}; do
+                if ! pct status \$i &>/dev/null && ! qm status \$i &>/dev/null; then
+                    echo \$i
+                    break
+                fi
+            done
+        ")
+
+        if [[ -z "$new_id" ]]; then
+            echo "${RED}Erreur: Aucun ID disponible trouvé${NC}"
+            return 1
+        fi
+
+        read -p "Utiliser l'ID $new_id à la place ? (oui/non) [oui]: " use_new_id
+        use_new_id=${use_new_id:-oui}
+
+        if [[ "$use_new_id" == "oui" ]]; then
+            id=$new_id
+            echo "${GREEN}✓ Utilisation de l'ID $id${NC}"
+        else
+            echo "${RED}Création annulée${NC}"
+            return 1
+        fi
+    fi
+
+    echo "${CYAN}=== Création d'un conteneur ===${NC}"
+    echo ""
+
+    # Lister les templates téléchargés
+    echo "${BLUE}Templates téléchargés:${NC}"
+    ssh -q -o LogLevel=ERROR "$host" "ls -1 /var/lib/vz/template/cache/ 2>/dev/null | head -15"
+    echo ""
+
+    read -p "Template (ex: debian-12-standard_12.12-1_amd64.tar.zst): " template
+    if [[ -z "$template" ]]; then
+        echo "${RED}Erreur: Template requis${NC}"
+        return 1
+    fi
+
+    read -p "Hostname (ex: ct$id): " hostname
+    hostname=${hostname:-ct$id}
+
+    # Afficher les storages disponibles AVANT de demander et trouver le meilleur
+    echo ""
+    echo "${BLUE}Storages disponibles:${NC}"
+    local storage_info=$(ssh -q -o LogLevel=ERROR "$host" "pvesm status -content rootdir" | awk 'NR>1 {printf "%s %.1f\n", $1, $6/1024/1024}')
+    echo "$storage_info" | while read name avail; do
+        printf "  %-15s %10.1f GB disponible\n" "$name" "$avail"
+    done
+
+    # Trouver le storage avec le plus d'espace
+    local best_storage=$(echo "$storage_info" | sort -k2 -rn | head -1 | awk '{print $1}')
+    echo ""
+
+    read -p "Storage [$best_storage]: " storage
+    storage=${storage:-$best_storage}
+
+    read -p "Memory (MB) [1024]: " memory
+    memory=${memory:-1024}
+
+    read -p "Disk size (GB) [8]: " disksize
+    disksize=${disksize:-8}
+
+    read -p "CPU cores [2]: " cores
+    cores=${cores:-2}
+
+    # Afficher les bridges réseau avec détails
+    echo ""
+    echo "${BLUE}Bridges réseau disponibles:${NC}"
+    ssh -q -o LogLevel=ERROR "$host" 'bash -s' << 'BRIDGE_SCRIPT'
+# Lire la config réseau pour les commentaires
+for bridge in $(ip -br link show type bridge 2>/dev/null | awk '{print $1}'); do
+    # Récupérer l'IP
+    ip_addr=$(ip -4 addr show $bridge 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -1)
+    [[ -z "$ip_addr" ]] && ip_addr="pas d'IP"
+
+    # Récupérer le commentaire depuis /etc/network/interfaces
+    comment=$(grep -A10 "iface $bridge" /etc/network/interfaces 2>/dev/null | grep -oP '(?<=#).*' | head -1 | xargs)
+    [[ -z "$comment" ]] && comment="(pas de description)"
+
+    printf "  %-10s %-20s %s\n" "$bridge" "$ip_addr" "$comment"
+done
+BRIDGE_SCRIPT
+    echo ""
+
+    read -p "Bridge [vmbr0]: " bridge
+    bridge=${bridge:-vmbr0}
+
+    read -p "Network (dhcp/manual) [dhcp]: " nettype
+    nettype=${nettype:-dhcp}
+
+    echo ""
+    read -p "Unprivileged (0=non, 1=oui) [1]: " unprivileged
+    unprivileged=${unprivileged:-1}
+
+    read -p "Nesting (0=non, 1=oui) [1]: " nesting
+    nesting=${nesting:-1}
+
+    # Vérifier si une clé SSH est disponible
+    local ssh_key=""
+    local use_ssh_key="non"
+    if [[ -f "$HOME/.ssh/id_ed25519.pub" ]]; then
+        ssh_key=$(cat "$HOME/.ssh/id_ed25519.pub")
+        use_ssh_key="oui"
+    elif [[ -f "$HOME/.ssh/id_rsa.pub" ]]; then
+        ssh_key=$(cat "$HOME/.ssh/id_rsa.pub")
+        use_ssh_key="oui"
+    fi
+
+    if [[ "$use_ssh_key" == "oui" ]]; then
+        echo ""
+        read -p "Utiliser votre clé SSH publique (recommandé) ? (oui/non) [oui]: " use_key
+        use_key=${use_key:-oui}
+        if [[ "$use_key" != "oui" ]]; then
+            use_ssh_key="non"
+        fi
+    fi
+
+    local rootpw=""
+    if [[ "$use_ssh_key" != "oui" ]]; then
+        # Demander le mot de passe root (obligatoire)
+        echo ""
+        while true; do
+            read -sp "Mot de passe root pour le CT (obligatoire): " rootpw
+            echo ""
+            if [[ -n "$rootpw" ]]; then
+                break
+            else
+                echo "${RED}Le mot de passe ne peut pas être vide. Veuillez en saisir un.${NC}"
+            fi
+        done
+    fi
+
+    echo ""
+    echo "${GREEN}Création du conteneur $id...${NC}"
+
+    # Construire la commande pct create
+    local pct_cmd="pct create $id local:vztmpl/$template \
+        --hostname $hostname \
+        --storage $storage \
+        --memory $memory \
+        --cores $cores \
+        --rootfs $storage:$disksize \
+        --unprivileged $unprivileged"
+
+    # Ajouter nesting si activé
+    if [[ "$nesting" == "1" ]]; then
+        pct_cmd="$pct_cmd --features nesting=1"
+    fi
+
+    # Ajouter la config réseau
+    if [[ "$nettype" == "dhcp" ]]; then
+        pct_cmd="$pct_cmd --net0 name=eth0,bridge=$bridge,ip=dhcp"
+    else
+        read -p "IP address (ex: 192.168.1.100/24): " ipaddr
+        read -p "Gateway (ex: 192.168.1.1): " gateway
+        pct_cmd="$pct_cmd --net0 name=eth0,bridge=$bridge,ip=$ipaddr,gw=$gateway"
+    fi
+
+    # Exécuter la création selon la méthode choisie
+    if [[ "$use_ssh_key" == "oui" ]]; then
+        # Créer le conteneur avec la clé SSH via un fichier temporaire sur l'hôte distant
+        ssh -q -o LogLevel=ERROR "$host" "bash -c '
+tmpkey=\$(mktemp)
+echo \"$ssh_key\" > \"\$tmpkey\"
+$pct_cmd --ssh-public-keys \"\$tmpkey\"
+exitcode=\$?
+rm -f \"\$tmpkey\"
+exit \$exitcode
+'"
+        local create_exit=$?
+    else
+        # Créer avec mot de passe (nécessite confirmation)
+        ssh -q -o LogLevel=ERROR "$host" bash <<EOFSCRIPT
+printf "%s\n%s\n" "$rootpw" "$rootpw" | $pct_cmd --password
+EOFSCRIPT
+        local create_exit=$?
+    fi
+    
+    if [[ $create_exit -ne 0 ]]; then
+        echo ""
+        echo "${RED}✗ Erreur lors de la création du conteneur${NC}"
+        return 1
+    fi
+
+    # Attendre que le fichier de configuration soit créé
+    sleep 2
+    
+    # Vérifier que le conteneur existe
+    local ct_exists=$(ssh -q -o LogLevel=ERROR "$host" "pct status $id &>/dev/null && echo yes || echo no")
+    if [[ "$ct_exists" != "yes" ]]; then
+        echo ""
+        echo "${RED}✗ Le conteneur n'a pas été créé correctement${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo "${GREEN}✓ Conteneur $id créé avec succès !${NC}"
+
+    # Proposer de démarrer le conteneur
+    echo ""
+    read -p "Démarrer le conteneur maintenant ? (oui/non) [oui]: " start_ct
+    start_ct=${start_ct:-oui}
+
+    if [[ "$start_ct" == "oui" ]]; then
+        # Vérifier s'il n'est pas déjà démarré
+        local is_running=$(ssh -q -o LogLevel=ERROR "$host" "pct status $id" | grep -q "running" && echo "yes" || echo "no")
+
+        if [[ "$is_running" == "no" ]]; then
+            echo "${BLUE}Démarrage du conteneur...${NC}"
+            ssh -q -o LogLevel=ERROR "$host" "pct start $id"
+        fi
+
+        # Attendre que le réseau soit opérationnel
+        echo "${CYAN}Attente de l'obtention de l'IP...${NC}"
+        sleep 5
+
+        # Récupérer l'IP
+        local ct_ip=$(ssh -q -o LogLevel=ERROR "$host" "pct exec $id -- hostname -I 2>/dev/null | awk '{print \$1}'")
+
+        echo ""
+        echo "${GREEN}✓ Conteneur démarré${NC}"
+        echo ""
+        echo "${BOLD}${CYAN}Informations de connexion:${NC}"
+        echo "  Hostname: $hostname"
+        if [[ -n "$ct_ip" ]]; then
+            echo "  IP: $ct_ip"
+            echo ""
+            echo "${YELLOW}Commandes utiles:${NC}"
+            echo "  pve $host shell $id"
+            if [[ "$use_ssh_key" == "oui" ]]; then
+                echo "  ssh root@$ct_ip"
+            fi
+        else
+            echo "  IP: (en cours d'obtention...)"
+        fi
+    else
+        echo "${YELLOW}Conteneur créé mais non démarré${NC}"
+        echo "Démarrer avec: pve $host start $id"
+    fi
+}
+
+# Fonction launch (création rapide et démarrage)
+lxc_launch() {
+    local host=$1
+    local template=$2
+    local hostname=$3
+    local id=$4
+
+    if [[ -z "$template" ]] || [[ -z "$hostname" ]]; then
+        echo -e "${RED}Usage: pve $host launch <template> <hostname> [id]${NC}"
+        echo ""
+        echo "Templates courts disponibles:"
+        echo "  debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, alpine-3.22"
+        echo ""
+        echo "Exemples:"
+        echo "  pve $host launch debian-12 webserver"
+        echo "  pve $host launch ubuntu-24.04 appserver 150"
+        return 1
+    fi
+
+    # Si pas d'ID fourni, trouver le prochain disponible
+    if [[ -z "$id" ]]; then
+        echo "${CYAN}Recherche d'un ID disponible...${NC}"
+        id=$(ssh -q -o LogLevel=ERROR "$host" "
+            for i in {100..999}; do
+                if ! pct status \$i &>/dev/null && ! qm status \$i &>/dev/null; then
+                    echo \$i
+                    break
+                fi
+            done
+        ")
+        if [[ -z "$id" ]]; then
+            echo -e "${RED}Erreur: Aucun ID disponible trouvé${NC}"
+            return 1
+        fi
+        echo "${GREEN}ID disponible trouvé: $id${NC}"
+    fi
+
+    # Mapper les noms de templates courts vers les noms complets
+    local full_template=""
+    case "$template" in
+        debian-12)
+            full_template="debian-12-standard_12.12-1_amd64.tar.zst"
+            ;;
+        debian-13)
+            full_template="debian-13-standard_13.1-2_amd64.tar.zst"
+            ;;
+        ubuntu-22.04|ubuntu-22)
+            full_template="ubuntu-22.04-standard_22.04-1_amd64.tar.zst"
+            ;;
+        ubuntu-24.04|ubuntu-24)
+            full_template="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
+            ;;
+        ubuntu-25.04|ubuntu-25)
+            full_template="ubuntu-25.04-standard_25.04-1.1_amd64.tar.zst"
+            ;;
+        alpine-3.22|alpine)
+            full_template="alpine-3.22-default_20250617_amd64.tar.xz"
+            ;;
+        *)
+            # Si c'est déjà un nom complet, l'utiliser tel quel
+            full_template="$template"
+            ;;
+    esac
+
+    # Vérifier si le template existe
+    local template_exists=$(ssh -q -o LogLevel=ERROR "$host" "test -f /var/lib/vz/template/cache/$full_template && echo yes || echo no")
+
+    if [[ "$template_exists" == "no" ]]; then
+        echo -e "${YELLOW}Template $full_template non trouvé localement${NC}"
+        echo -e "${BLUE}Téléchargement du template...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "pveam download local $full_template"
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}Erreur lors du téléchargement du template${NC}"
+            return 1
+        fi
+    fi
+
+    # Valeurs par défaut
+    local storage="nvme"
+    local memory="1024"
+    local disksize="8"
+    local cores="2"
+
+    echo ""
+    echo -e "${GREEN}Création du conteneur $id ($hostname)...${NC}"
+    echo "  Template: $full_template"
+    echo "  Storage: $storage"
+    echo "  Memory: ${memory}MB"
+    echo "  Disk: ${disksize}GB"
+    echo "  Cores: $cores"
+    echo "  Unprivileged: Oui"
+    echo "  Nesting: Oui"
+    echo ""
+
+    # Créer le conteneur
+    local create_result=$(ssh -q -o LogLevel=ERROR "$host" "pct create $id local:vztmpl/$full_template \
+        --hostname $hostname \
+        --storage $storage \
+        --memory $memory \
+        --cores $cores \
+        --rootfs $storage:$disksize \
+        --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+        --unprivileged 1 \
+        --features nesting=1 \
+        --onboot 0" 2>&1)
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}✓ Conteneur créé avec succès${NC}"
+
+        # Démarrer le conteneur
+        echo -e "${BLUE}Démarrage du conteneur...${NC}"
+        ssh -q -o LogLevel=ERROR "$host" "pct start $id"
+
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}✓ Conteneur $id démarré${NC}"
+            echo ""
+            echo "${CYAN}Commandes utiles:${NC}"
+            echo "  pve $host shell $id        # Ouvrir un shell"
+            echo "  pve $host exec $id -- <cmd>  # Exécuter une commande"
+            echo "  pve $host info $id          # Voir les infos"
+        else
+            echo -e "${RED}✗ Erreur lors du démarrage${NC}"
+            return 1
+        fi
+    else
+        echo -e "${RED}✗ Erreur lors de la création:${NC}"
+        echo "$create_result"
+        return 1
+    fi
+}
+
+# Fonction create VM (mode interactif)
+vm_create() {
+    local host=$1
+    local id=$2
+
+    if [[ -z "$id" ]]; then
+        echo "${RED}Usage: pve $host create-vm <id>${NC}"
+        return 1
+    fi
+
+    # Vérifier si l'ID est déjà utilisé
+    local id_in_use=$(ssh -q -o LogLevel=ERROR "$host" "pct status $id &>/dev/null && echo yes || (qm status $id &>/dev/null && echo yes || echo no)")
+    if [[ "$id_in_use" == "yes" ]]; then
+        echo "${YELLOW}⚠ L'ID $id est déjà utilisé${NC}"
+        local new_id=$(ssh -q -o LogLevel=ERROR "$host" "
+            for i in {$id..999}; do
+                if ! pct status \$i &>/dev/null && ! qm status \$i &>/dev/null; then
+                    echo \$i
+                    break
+                fi
+            done
+        ")
+        if [[ -z "$new_id" ]]; then
+            echo "${RED}Erreur: Aucun ID disponible trouvé${NC}"
+            return 1
+        fi
+        read -p "Utiliser l'ID $new_id à la place ? (oui/non) [oui]: " use_new_id
+        use_new_id=${use_new_id:-oui}
+        if [[ "$use_new_id" == "oui" ]]; then
+            id=$new_id
+            echo "${GREEN}✓ Utilisation de l'ID $id${NC}"
+        else
+            echo "${RED}Création annulée${NC}"
+            return 1
+        fi
+    fi
+
+    echo "${CYAN}=== Création d'une VM ===${NC}"
+    echo ""
+
+    read -p "Nom de la VM (ex: vm$id): " vmname
+    vmname=${vmname:-vm$id}
+
+    # Afficher les storages disponibles
+    echo ""
+    echo "${BLUE}Storages disponibles:${NC}"
+    local storage_info=$(ssh -q -o LogLevel=ERROR "$host" "pvesm status -content images,rootdir" | awk 'NR>1 {printf "%s %.1f\n", $1, $6/1024/1024}')
+    echo "$storage_info" | while read name avail; do
+        printf "  %-15s %10.1f GB disponible\n" "$name" "$avail"
+    done
+    local best_storage=$(echo "$storage_info" | sort -k2 -rn | head -1 | awk '{print $1}')
+    echo ""
+
+    read -p "Storage [$best_storage]: " storage
+    storage=${storage:-$best_storage}
+
+    read -p "Memory (MB) [2048]: " memory
+    memory=${memory:-2048}
+
+    read -p "Disk size (GB) [32]: " disksize
+    disksize=${disksize:-32}
+
+    read -p "CPU cores [2]: " cores
+    cores=${cores:-2}
+
+    read -p "CPU sockets [1]: " sockets
+    sockets=${sockets:-1}
+
+    # Afficher les bridges réseau
+    echo ""
+    echo "${BLUE}Bridges réseau disponibles:${NC}"
+    ssh -q -o LogLevel=ERROR "$host" 'bash -s' << 'BRIDGE_SCRIPT'
+for bridge in $(ip -br link show type bridge 2>/dev/null | awk '{print $1}'); do
+    ip_addr=$(ip -4 addr show $bridge 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -1)
+    [[ -z "$ip_addr" ]] && ip_addr="pas d'IP"
+    comment=$(grep -A10 "iface $bridge" /etc/network/interfaces 2>/dev/null | grep -oP '(?<=#).*' | head -1 | xargs)
+    [[ -z "$comment" ]] && comment="(pas de description)"
+    printf "  %-10s %-20s %s\n" "$bridge" "$ip_addr" "$comment"
+done
+BRIDGE_SCRIPT
+    echo ""
+
+    read -p "Bridge [vmbr0]: " bridge
+    bridge=${bridge:-vmbr0}
+
+    read -p "Network model (e1000/virtio/rtl8139) [virtio]: " netmodel
+    netmodel=${netmodel:-virtio}
+
+    # ISO (obligatoire pour avoir un OS bootable)
+    echo ""
+    echo "${YELLOW}Une ISO est nécessaire pour installer un OS dans la VM${NC}"
+    echo ""
+
+    # Lister les ISOs disponibles par storage
+    local iso_list=$(ssh -q -o LogLevel=ERROR "$host" 'bash -s' << 'ISO_SCRIPT'
+for storage_dir in /var/lib/vz/template/iso /mnt/pve/*/template/iso; do
+    if [[ -d "$storage_dir" ]]; then
+        if [[ "$storage_dir" == "/var/lib/vz/template/iso" ]]; then
+            storage_name="local"
+        else
+            storage_name=$(echo "$storage_dir" | cut -d'/' -f4)
+        fi
+
+        iso_count=$(ls -1 "$storage_dir"/*.iso 2>/dev/null | wc -l)
+        if [[ $iso_count -gt 0 ]]; then
+            echo "=== Storage: $storage_name ==="
+            ls -1 "$storage_dir"/*.iso 2>/dev/null | xargs -n1 basename
+        fi
+    fi
+done
+ISO_SCRIPT
+)
+
+    if [[ -n "$iso_list" ]]; then
+        echo "${BLUE}ISOs disponibles:${NC}"
+        echo "$iso_list"
+        echo ""
+    else
+        echo "${YELLOW}Aucune ISO trouvée${NC}"
+        echo ""
+    fi
+
+    read -p "Nom de l'ISO (laisser vide pour une VM vide): " iso_name
+
+    local iso_storage="local"
+    if [[ -n "$iso_name" ]]; then
+        echo ""
+        read -p "Storage de l'ISO [local]: " iso_storage
+        iso_storage=${iso_storage:-local}
+    fi
+
+    echo ""
+    echo "${GREEN}Création de la VM $id...${NC}"
+
+    # Créer la VM
+    if [[ -n "$iso_name" ]]; then
+        # Avec ISO - booter sur le cdrom puis le disque
+        ssh -q -o LogLevel=ERROR "$host" "qm create $id \
+            --name '$vmname' \
+            --memory $memory \
+            --cores $cores \
+            --sockets $sockets \
+            --net0 $netmodel,bridge=$bridge \
+            --scsihw virtio-scsi-pci \
+            --scsi0 $storage:$disksize \
+            --ide2 $iso_storage:iso/$iso_name,media=cdrom \
+            --boot 'order=ide2;scsi0' \
+            --serial0 socket \
+            --vga std \
+            --ostype l26"
+    else
+        # Sans ISO - disque vide
+        ssh -q -o LogLevel=ERROR "$host" "qm create $id \
+            --name '$vmname' \
+            --memory $memory \
+            --cores $cores \
+            --sockets $sockets \
+            --net0 $netmodel,bridge=$bridge \
+            --scsihw virtio-scsi-pci \
+            --scsi0 $storage:$disksize \
+            --boot 'order=scsi0' \
+            --serial0 socket \
+            --vga std \
+            --ostype l26"
+    fi
+
+    if [[ $? -ne 0 ]]; then
+        echo ""
+        echo "${RED}✗ Erreur lors de la création de la VM${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo "${GREEN}✓ VM $id créée avec succès !${NC}"
+
+    # Proposer de démarrer seulement si une ISO est attachée
+    echo ""
+    if [[ -n "$iso_name" ]]; then
+        read -p "Démarrer la VM maintenant ? (oui/non) [oui]: " start_vm
+        start_vm=${start_vm:-oui}
+
+        if [[ "$start_vm" == "oui" ]]; then
+            echo "${BLUE}Démarrage de la VM...${NC}"
+            ssh -q -o LogLevel=ERROR "$host" "qm start $id"
+            echo ""
+            echo "${GREEN}✓ VM démarrée${NC}"
+            echo ""
+            echo "${CYAN}La VM démarre sur l'ISO $iso_name${NC}"
+            echo ""
+            echo "${YELLOW}Accéder à la console:${NC}"
+            echo "  ${GREEN}Option 1 (Console série):${NC}"
+            echo "    pve $host shell $id"
+            echo ""
+            echo "  ${GREEN}Option 2 (Console VNC - recommandé pour installations graphiques):${NC}"
+            echo "    Ouvrir l'interface web Proxmox: https://$host:8006"
+            echo "    Puis: VM $id > Console"
+            echo ""
+            echo "${YELLOW}Autres commandes:${NC}"
+            echo "  pve $host info $id            # Voir les infos de la VM"
+        else
+            echo "${YELLOW}VM créée mais non démarrée${NC}"
+            echo "Démarrer avec: pve $host start $id"
+        fi
+    else
+        echo "${YELLOW}VM vide créée (aucune ISO attachée)${NC}"
+        echo ""
+        echo "${CYAN}Pour attacher une ISO et démarrer la VM:${NC}"
+        echo "  1. Télécharger une ISO si besoin: pve $host download <iso>"
+        echo "  2. Attacher l'ISO: ssh $host \"qm set $id --cdrom local:iso/<nom-iso>\""
+        echo "  3. Démarrer: pve $host start $id"
+        echo "  4. Ouvrir la console: pve $host shell $id"
+    fi
+}
+
+# Mode interactif
+interactive_mode() {
+    local host=$1
+
+    echo -e "${GREEN}=== Mode interactif PVE pour $host ===${NC}"
+    echo "Tapez 'help' pour l'aide, 'exit' pour quitter"
+    echo ""
+
+    while true; do
+        echo -ne "${CYAN}pve@$host>${NC} "
+        read -r -a cmd
+
+        if [[ ${#cmd[@]} -eq 0 ]]; then
+            continue
+        fi
+
+        case "${cmd[0]}" in
+            exit|quit)
+                echo "Au revoir!"
+                break
+                ;;
+            help)
+                show_help
+                ;;
+            *)
+                # Re-router la commande avec l'hôte
+                handle_command "$host" "${cmd[@]}"
+                ;;
+        esac
+        echo ""
+    done
+}
+
+# Fonction pour gérer les commandes
+handle_command() {
+    local host=$1
+    shift
+    local command=$1
+
+    case "$command" in
+        ls|list)
+            lxc_ls "$host"
+            ;;
+        exec)
+            shift
+            lxc_exec "$host" "$@"
+            ;;
+        shell|enter)
+            lxc_shell "$host" "$2"
+            ;;
+        start)
+            lxc_start "$host" "$2"
+            ;;
+        stop)
+            lxc_stop "$host" "$2"
+            ;;
+        restart|reboot)
+            lxc_restart "$host" "$2"
+            ;;
+        delete|destroy|rm)
+            lxc_delete "$host" "$2"
+            ;;
+        info|config)
+            lxc_info "$host" "$2"
+            ;;
+        list-templates)
+            lxc_list_templates "$host"
+            ;;
+        list-images)
+            list_images "$host"
+            ;;
+        list-iso)
+            list_iso "$host"
+            ;;
+        list-storage)
+            list_storage "$host"
+            ;;
+        download)
+            lxc_download "$host" "$2"
+            ;;
+        create)
+            lxc_create "$host" "$2"
+            ;;
+        create-vm)
+            vm_create "$host" "$2"
+            ;;
+        launch)
+            shift
+            lxc_launch "$host" "$@"
+            ;;
+        interactive|i)
+            interactive_mode "$host"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            echo -e "${RED}Commande inconnue: $command${NC}"
+            echo "Tapez 'pve $host help' pour l'aide"
+            return 1
+            ;;
+    esac
+}
+
+# Main
+if [[ $# -eq 0 ]]; then
+    show_help
+    exit 0
+fi
+
+# Gérer "pve help" sans hôte
+if [[ "$1" == "help" || "$1" == "--help" || "$1" == "-h" ]]; then
+    show_help
+    exit 0
+fi
+
+HOST=$1
+shift
+
+if [[ $# -eq 0 ]]; then
+    echo -e "${RED}Erreur: Vous devez spécifier une commande${NC}"
+    echo "Usage: pve $HOST <command> [args]"
+    echo "Tapez 'pve help' pour l'aide"
+    exit 1
+fi
+
+# Gérer la commande
+handle_command "$HOST" "$@"
